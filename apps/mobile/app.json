@@ -1,0 +1,15 @@
+{
+  "expo": {
+    "name": "Side Work",
+    "slug": "sidework",
+    "scheme": "sidework",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": { "bundleIdentifier": "com.alliancedigitalstudios.sidework", "supportsTablet": false,
+      "infoPlist": { "NSFaceIDUsageDescription": "Unlock Side Work with Face ID." } },
+    "android": { "package": "com.alliancedigitalstudios.sidework" },
+    "plugins": ["expo-router", "expo-secure-store", "expo-local-authentication",
+      ["@op-engineering/op-sqlite", { "sqlcipher": true }]]
+  }
+}
