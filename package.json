@@ -1,0 +1,14 @@
+{
+  "name": "sidework",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "test": "npm run test -w packages/engine",
+    "typecheck": "npm run typecheck -w packages/engine",
+    "mobile": "npm run start -w apps/mobile"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
