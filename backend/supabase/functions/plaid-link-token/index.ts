@@ -1,3 +1,151 @@
-// plaid-link-token — see docs/BUILD_PLAN.md section 4 and docs/SECURITY.md section 4.
-// Secrets via Deno.env: PLAID_CLIENT_ID, PLAID_SECRET, PLAID_ENV. Never return access tokens to clients.
-Deno.serve(async (_req) => new Response(JSON.stringify({ todo: "plaid-link-token" }), { headers: { "content-type": "application/json" } }));
+// ---- shared (inlined into each function; source of truth: backend/supabase/functions/_shared.ts) ----
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+
+const PLAID_ENV = Deno.env.get("PLAID_ENV") ?? "sandbox";
+const PLAID_BASE = `https://${PLAID_ENV}.plaid.com`;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
+  (() => { try { return Object.values(JSON.parse(Deno.env.get("SUPABASE_SECRET_KEYS") ?? "{}"))[0] as string; } catch { return ""; } })();
+const admin = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
+const enc = new TextEncoder();
+
+class HttpError extends Error { constructor(public status: number, msg: string) { super(msg); } }
+
+const cors = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-headers": "authorization, content-type, apikey, x-client-info",
+};
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...cors } });
+}
+function handle(fn: (req: Request) => Promise<Response>) {
+  return async (req: Request) => {
+    if (req.method === "OPTIONS") return new Response(null, { headers: cors });
+    try { return await fn(req); }
+    catch (e) {
+      const status = e instanceof HttpError ? e.status : 500;
+      // Never log request bodies, tokens or amounts. Error codes only.
+      console.error(JSON.stringify({ fn: new URL(req.url).pathname, status, code: (e as Error).message }));
+      return json({ error: status === 500 ? "internal_error" : (e as Error).message }, status);
+    }
+  };
+}
+
+async function plaid(path: string, body: Record<string, unknown>) {
+  const r = await fetch(PLAID_BASE + path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: Deno.env.get("PLAID_CLIENT_ID"), secret: Deno.env.get("PLAID_SECRET"), ...body }),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new HttpError(502, `plaid_${j.error_code ?? r.status}`);
+  return j;
+}
+
+async function requireUser(req: Request) {
+  const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (!token) throw new HttpError(401, "unauthorized");
+  const { data, error } = await admin.auth.getUser(token);
+  if (error || !data.user) throw new HttpError(401, "unauthorized");
+  await admin.from("users").upsert({ id: data.user.id, last_seen_at: new Date().toISOString() });
+  return data.user;
+}
+
+async function audit(userId: string | null, event: string) {
+  await admin.from("audit_events").insert({ user_id: userId, event });
+}
+
+async function sha256Hex(s: string) {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(s)));
+  return [...d].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Envelope-style encryption: per-user AES-256-GCM key derived (HKDF) from TOKEN_ENC_KEY.
+async function userKey(userId: string) {
+  const raw = Deno.env.get("TOKEN_ENC_KEY");
+  if (!raw) throw new HttpError(500, "missing_enc_key");
+  const master = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+  const base = await crypto.subtle.importKey("raw", master, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: enc.encode("sidework-plaid-v1"), info: enc.encode(userId) },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+  );
+}
+const toHex = (b: Uint8Array) => "\\x" + [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+const fromHex = (s: string) => Uint8Array.from(s.replace(/^\\x/, "").match(/../g)!.map((x) => parseInt(x, 16)));
+async function encryptToken(userId: string, token: string) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: enc.encode(userId) }, await userKey(userId), enc.encode(token)));
+  const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12);
+  return toHex(out);
+}
+async function decryptToken(userId: string, hex: string) {
+  const b = fromHex(hex);
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b.slice(0, 12), additionalData: enc.encode(userId) }, await userKey(userId), b.slice(12));
+  return new TextDecoder().decode(pt);
+}
+
+// Pull new transactions with a cursor; keep DEPOSITS ONLY (Plaid reports money in as negative amounts).
+// Merchant names and categories are never stored.
+async function syncItem(item: { item_id: string; user_id: string; access_token_enc: string; cursor: string | null }) {
+  const accessToken = await decryptToken(item.user_id, item.access_token_enc);
+  let cursor = item.cursor ?? undefined;
+  let hasMore = true;
+  const rows: Record<string, unknown>[] = [];
+  const removed: string[] = [];
+  const masks: Record<string, string | null> = {};
+  while (hasMore) {
+    const r = await plaid("/transactions/sync", { access_token: accessToken, cursor, count: 500 });
+    for (const a of r.accounts ?? []) masks[a.account_id] = a.mask ?? null;
+    for (const t of [...r.added, ...r.modified]) {
+      if (t.amount < 0) rows.push({
+        user_id: item.user_id, item_id: item.item_id, plaid_txn_id: t.transaction_id,
+        date: t.date, amount: Math.abs(t.amount), pending: t.pending, account_mask: masks[t.account_id] ?? null,
+      });
+    }
+    removed.push(...r.removed.map((x: { transaction_id: string }) => x.transaction_id));
+    cursor = r.next_cursor; hasMore = r.has_more;
+  }
+  if (rows.length) await admin.from("synced_deposits").upsert(rows, { onConflict: "plaid_txn_id" });
+  if (removed.length) await admin.from("synced_deposits").delete().in("plaid_txn_id", removed);
+  const cutoff = new Date(Date.now() - 90 * 864e5).toISOString().slice(0, 10);
+  await admin.from("synced_deposits").delete().eq("item_id", item.item_id).lt("date", cutoff);
+  await admin.from("plaid_items").update({ cursor, last_sync_at: new Date().toISOString(), status: "active" }).eq("item_id", item.item_id);
+  return rows.length;
+}
+
+async function removeItem(item: { item_id: string; user_id: string; access_token_enc: string }, event: string) {
+  try { await plaid("/item/remove", { access_token: await decryptToken(item.user_id, item.access_token_enc) }); }
+  catch (_) { /* already removed at Plaid; still delete locally */ }
+  await admin.from("synced_deposits").delete().eq("item_id", item.item_id);
+  await admin.from("plaid_items").delete().eq("item_id", item.item_id);
+  await audit(item.user_id, event);
+}
+// ---- end shared ----
+
+// POST (auth) -> { link_token }. Optional body { item_id } opens Link in update mode to relink.
+Deno.serve(handle(async (req) => {
+  const user = await requireUser(req);
+  const body = await req.json().catch(() => ({}));
+  const params: Record<string, unknown> = {
+    client_name: "Side Work",
+    language: "en",
+    country_codes: ["US"],
+    user: { client_user_id: await sha256Hex(user.id) },
+    webhook: `${SUPABASE_URL}/functions/v1/plaid-webhook`,
+  };
+  const redirect = Deno.env.get("PLAID_REDIRECT_URI");
+  if (redirect) params.redirect_uri = redirect;
+  if (body.item_id) {
+    const { data: item } = await admin.from("plaid_items").select("*").eq("item_id", body.item_id).eq("user_id", user.id).single();
+    if (!item) throw new HttpError(404, "not_found");
+    params.access_token = await decryptToken(user.id, item.access_token_enc);
+  } else {
+    params.products = ["transactions"];
+    params.transactions = { days_requested: 90 };
+    params.account_filters = { depository: { account_subtypes: ["checking", "savings", "prepaid"] } };
+  }
+  const r = await plaid("/link/token/create", params);
+  return json({ link_token: r.link_token, expiration: r.expiration });
+}));
